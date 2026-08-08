@@ -34,6 +34,9 @@ conan_export/
 # Benchmark / test data
 bench*.json
 warmup*.json
+/results/
+/docs/benchmark-result-*.md
+/docs/perf-analysis-report.md
 
 # Local perf / benchmark outputs
 perf*.data
@@ -42,6 +45,11 @@ out*.perf
 out*.folded
 flamegraph*.svg
 *执行结果*.txt
+
+# Local engineering notes and generated design records
+/开发笔记.md
+/面试笔记.md
+/docs/项目关键模块调用流程.md
 
 # Images (not docs)
 *.png
