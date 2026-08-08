@@ -1,9 +1,10 @@
 #ifndef CIRCUIT_BREAKER_H_
 #define CIRCUIT_BREAKER_H_
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
+#include <optional>
 #include <string>
 
 #include <spdlog/spdlog.h>
@@ -36,106 +37,147 @@ struct CircuitBreakerConfig {
 // 熔断类
 class CircuitBreaker {
 public:
+    using Permit = std::uint64_t;
+
     // 禁止隐式转换
     explicit CircuitBreaker(std::string name, CircuitBreakerConfig cfg = {})
         : name_(std::move(name)), cfg_(cfg) {}
 
     // 是否允许请求通过，处理三种状态流转
-    bool Allow() {
-        auto state = state_.load();
+    std::optional<Permit> Allow() {
+        std::lock_guard<std::mutex> lock(mutex_);
         // 未触发熔断
-        if (state == CircuitState::Closed) {
-            return true;
+        if (state_ == CircuitState::Closed) {
+            return generation_;
         }
         // 触发熔断
-        if (state == CircuitState::Open) {
+        if (state_ == CircuitState::Open) {
             // 检查是否到了恢复时间
             auto now = NowMs();
             // 检查是否超过恢复时间
-            if (now - open_time_ms_.load() >= cfg_.recovery_timeout_ms) {
-                // 尝试切换到 HalfOpen
-                CircuitState expected = CircuitState::Open;
-                // 原子操作切换状态
-                if (state_.compare_exchange_strong(expected, CircuitState::HalfOpen)) {
-                    // 重置计数
-                    half_open_calls_.store(0);
-                    half_open_successes_.store(0);
-                    spdlog::warn("[CircuitBreaker:{}] -> HalfOpen", name_);
-                }
-                return true;
+            if (now - open_time_ms_ >= cfg_.recovery_timeout_ms) {
+                state_ = CircuitState::HalfOpen;
+                ++generation_;
+                half_open_calls_ = 0;
+                half_open_successes_ = 0;
+                spdlog::warn("[CircuitBreaker:{}] -> HalfOpen", name_);
+            } else {
+                return std::nullopt;
             }
-            return false;
         }
         // HalfOpen：限制探测请求数
-        if (state == CircuitState::HalfOpen) {
-            auto calls = half_open_calls_.fetch_add(1);
-            return calls < cfg_.half_open_max_calls;
+        if (state_ == CircuitState::HalfOpen) {
+            if (half_open_calls_ >= cfg_.half_open_max_calls) {
+                return std::nullopt;
+            }
+            ++half_open_calls_;
+            return generation_;
         }
-        return false;
+        return std::nullopt;
     }
 
     // 记录一次成功
-    void RecordSuccess() {
-        auto state = state_.load();
-        if (state == CircuitState::Closed) {
+    void RecordSuccess(Permit permit) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (permit != generation_) {
+            return;
+        }
+        if (state_ == CircuitState::Closed) {
             // 不在 Closed 状态下简单清零 consecutive_failures_
             // 只有在距离最后一次失败超过 failure_reset_timeout_ms 后才清零
             // 防止 "失败-成功-失败-成功" 交替模式下的熔断失效：
             //   例如: F,F,F,F,S → 此前 consecutive_failures_=4，
             //   如果不重置，后续再失败就会累加到5触发熔断
             auto now = NowMs();
-            auto last_fail = last_failure_time_ms_.load();
+            auto last_fail = last_failure_time_ms_;
             if (last_fail == 0 || (now - last_fail) >= cfg_.failure_reset_timeout_ms) {
-                consecutive_failures_.store(0);
+                consecutive_failures_ = 0;
             }
             return;
         }
         // 半开状态下请求成功
-        if (state == CircuitState::HalfOpen) {
-            auto succ = half_open_successes_.fetch_add(1) + 1;
+        if (state_ == CircuitState::HalfOpen) {
+            auto succ = ++half_open_successes_;
             // 检查半开状态下请求成功次数是否抵达恢复阈值
-            if (succ >= cfg_.success_threshold) {
-                state_.store(CircuitState::Closed);
+            if (succ >= cfg_.success_threshold && succ == half_open_calls_) {
+                state_ = CircuitState::Closed;
+                ++generation_;
                 // 失败计数清零
-                consecutive_failures_.store(0);
-                last_failure_time_ms_.store(0);
+                consecutive_failures_ = 0;
+                last_failure_time_ms_ = 0;
+                open_time_ms_ = 0;
+                half_open_calls_ = 0;
+                half_open_successes_ = 0;
                 spdlog::info("[CircuitBreaker:{}] -> Closed (recovered)", name_);
             }
         }
     }
 
     // 记录一次失败
-    void RecordFailure() {
-        auto state = state_.load();
-        if (state == CircuitState::HalfOpen) {
+    void RecordFailure(Permit permit) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (permit != generation_) {
+            return;
+        }
+        if (state_ == CircuitState::HalfOpen) {
             // 探测失败，重新打开熔断
-            open_time_ms_.store(NowMs());
-            state_.store(CircuitState::Open);
+            open_time_ms_ = NowMs();
+            half_open_calls_ = 0;
+            half_open_successes_ = 0;
+            state_ = CircuitState::Open;
+            ++generation_;
             spdlog::warn("[CircuitBreaker:{}] HalfOpen probe failed -> Open", name_);
             return;
         }
         // 正常请求时失败
-        if (state == CircuitState::Closed) {
+        if (state_ == CircuitState::Closed) {
             auto now = NowMs();
-            auto last_fail = last_failure_time_ms_.load();
+            auto last_fail = last_failure_time_ms_;
             // 如果距离上次失败超过重置窗口，说明之前的失败已经"过期"，先清零再计数
             if (last_fail > 0 && (now - last_fail) >= cfg_.failure_reset_timeout_ms) {
-                consecutive_failures_.store(0);
+                consecutive_failures_ = 0;
             }
-            last_failure_time_ms_.store(now);
-            auto failures = consecutive_failures_.fetch_add(1) + 1;
+            last_failure_time_ms_ = now;
+            auto failures = ++consecutive_failures_;
             if (failures >= cfg_.failure_threshold) {
-                state_.store(CircuitState::Open); // 切换至熔断开状态
-                open_time_ms_.store(NowMs());
+                open_time_ms_ = now;
+                half_open_calls_ = 0;
+                half_open_successes_ = 0;
+                state_ = CircuitState::Open; // 切换至熔断开状态
+                ++generation_;
                 spdlog::error("[CircuitBreaker:{}] -> Open (failures={})", name_, failures);
             }
         }
     }
 
-    CircuitState State() const { return state_.load(); }
+    void Cancel(Permit permit) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (permit != generation_ || state_ != CircuitState::HalfOpen || half_open_calls_ == 0) {
+            return;
+        }
+
+        --half_open_calls_;
+        if (half_open_successes_ >= cfg_.success_threshold &&
+            half_open_successes_ == half_open_calls_) {
+            state_ = CircuitState::Closed;
+            ++generation_;
+            consecutive_failures_ = 0;
+            last_failure_time_ms_ = 0;
+            open_time_ms_ = 0;
+            half_open_calls_ = 0;
+            half_open_successes_ = 0;
+            spdlog::info("[CircuitBreaker:{}] -> Closed (recovered)", name_);
+        }
+    }
+
+    CircuitState State() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return state_;
+    }
 
     std::string StateName() const {
-        switch (state_.load()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        switch (state_) {
             case CircuitState::Closed:   return "Closed";
             case CircuitState::Open:     return "Open";
             case CircuitState::HalfOpen: return "HalfOpen";
@@ -154,13 +196,15 @@ private:
     std::string name_;
     CircuitBreakerConfig cfg_;
 
-    std::atomic<CircuitState> state_{CircuitState::Closed};
-    std::atomic_int64_t consecutive_failures_{0};
-    std::atomic_int64_t open_time_ms_{0};
-    std::atomic_int64_t half_open_calls_{0};
-    std::atomic_int64_t half_open_successes_{0};
+    mutable std::mutex mutex_;
+    CircuitState state_{CircuitState::Closed};
+    Permit generation_{0};
+    int64_t consecutive_failures_{0};
+    int64_t open_time_ms_{0};
+    int64_t half_open_calls_{0};
+    int64_t half_open_successes_{0};
     // 记录最近一次失败的时间戳，用于失败计数的时间窗口衰减
-    std::atomic_int64_t last_failure_time_ms_{0};
+    int64_t last_failure_time_ms_{0};
 };
 
 } // namespace kcache

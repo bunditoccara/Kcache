@@ -35,8 +35,9 @@ auto KCacheClient::Get(const std::string& group, const std::string& key) -> std:
     }
 
     // ★ 新增：熔断检查
-    auto* breaker = GetOrCreateBreaker(target_addr);
-    if (!breaker->Allow()) {
+    auto breaker = GetOrCreateBreaker(target_addr);
+    auto permit = breaker->Allow();
+    if (!permit) {
         spdlog::warn("[CircuitBreaker:client:{}] Open, skipping Get key={}", target_addr, key);
         return std::nullopt;  // 或尝试下一个节点（进阶方案）
     }
@@ -44,6 +45,7 @@ auto KCacheClient::Get(const std::string& group, const std::string& key) -> std:
     auto channel = GetOrCreateChannel(target_addr); // 创建访问通道
     auto client = pb::KCache::NewStub(channel); // 根据通道创建客户端Stub
     if (!client) {
+        breaker->Cancel(*permit);
         spdlog::error("Failed to create gRPC stub for node: {}", target_addr);
         return std::nullopt;
     }
@@ -62,15 +64,16 @@ auto KCacheClient::Get(const std::string& group, const std::string& key) -> std:
     // Get由protobuf结合proto文件自动生成的，后续的Set、Invalidate、Delete同理
     auto status = client->Get(&context, request, &response); // 处理通信结果
     if (status.ok()) {
-        breaker->RecordSuccess(); // 记录一次成功
+        breaker->RecordSuccess(*permit); // 记录一次成功
         return response.value();
     } else {
         // NOT_FOUND（缓存未命中）是正常业务语义，不计入故障；
         // 其余（含 DEADLINE_EXCEEDED / UNAVAILABLE / INTERNAL 等）均计入 RecordFailure 触发熔断。
         if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
+            breaker->RecordSuccess(*permit);
             spdlog::debug("Get key={} on node {}: NOT_FOUND (cache miss)", key, target_addr);
         } else {
-            breaker->RecordFailure(); // 记录一次失败（含超时、网络故障等）
+            breaker->RecordFailure(*permit); // 记录一次失败（含超时、网络故障等）
             spdlog::warn("Get failed on node {}: {} ({})", target_addr, status.error_message(),
                          static_cast<int>(status.error_code()));
         }
@@ -86,8 +89,9 @@ bool KCacheClient::Set(const std::string& group, const std::string& key, const s
     }
 
     // ★ 熔断检查
-    auto* breaker = GetOrCreateBreaker(target_addr);
-    if (!breaker->Allow()) {
+    auto breaker = GetOrCreateBreaker(target_addr);
+    auto permit = breaker->Allow();
+    if (!permit) {
         spdlog::warn("[CircuitBreaker:client:{}] Open, skipping Set key={}", target_addr, key);
         return false;
     }
@@ -95,6 +99,7 @@ bool KCacheClient::Set(const std::string& group, const std::string& key, const s
     auto channel = GetOrCreateChannel(target_addr);
     auto client = pb::KCache::NewStub(channel);
     if (!client) {
+        breaker->Cancel(*permit);
         spdlog::error("Failed to create gRPC stub for node: {}", target_addr);
         return false;
     }
@@ -111,9 +116,9 @@ bool KCacheClient::Set(const std::string& group, const std::string& key, const s
     auto status = client->Set(&context, request, &response); // 处理通信结果
 
     if (status.ok() && response.value()) {
-        breaker->RecordSuccess(); // 记录一次成功
+        breaker->RecordSuccess(*permit); // 记录一次成功
     } else {
-        breaker->RecordFailure();
+        breaker->RecordFailure(*permit);
         spdlog::error("Failed to set value on node {}: {}", target_addr, status.error_message());
         return false;
     }
@@ -124,8 +129,9 @@ bool KCacheClient::Set(const std::string& group, const std::string& key, const s
         std::lock_guard<std::mutex> lock(nodes_mutex_);
         for (const auto& addr : cache_nodes_) {
             if (addr != target_addr) {
-                auto* peer_breaker = GetOrCreateBreaker(addr); // 获取该节点的熔断器
-                if(!peer_breaker->Allow()){ // 该节点触发熔断，跳过该节点
+                auto peer_breaker = GetOrCreateBreaker(addr); // 获取该节点的熔断器
+                auto peer_permit = peer_breaker->Allow();
+                if(!peer_permit){ // 该节点触发熔断，跳过该节点
                     spdlog::warn("Skip Invalidate on circuit-broken node {}", addr);
                     continue;
                 }
@@ -140,9 +146,9 @@ bool KCacheClient::Set(const std::string& group, const std::string& key, const s
 
                 auto status = client->Invalidate(&ctx, request, &response); // 处理通信结果
                 if (status.ok() && response.value()) {
-                    peer_breaker->RecordSuccess(); // 记录一次成功
+                    peer_breaker->RecordSuccess(*peer_permit); // 记录一次成功
                 } else {
-                    peer_breaker->RecordFailure();
+                    peer_breaker->RecordFailure(*peer_permit);
                     all_success = false;
                     spdlog::warn("Failed to Invalidate key on node {}", addr);
                 }
@@ -168,8 +174,9 @@ bool KCacheClient::Delete(const std::string& group, const std::string& key) {
         }
         // 查找所有存活节点
         for (const auto& addr : cache_nodes_) {
-            auto* peer_breaker = GetOrCreateBreaker(addr);
-            if(!peer_breaker->Allow()){
+            auto peer_breaker = GetOrCreateBreaker(addr);
+            auto peer_permit = peer_breaker->Allow();
+            if(!peer_permit){
                 spdlog::warn("Circuit breaker open for node {}, skipping Delete", addr);
                 all_success = false;
                 continue;
@@ -184,9 +191,9 @@ bool KCacheClient::Delete(const std::string& group, const std::string& key) {
 
             auto status = client->Delete(&ctx, request, &response); // 处理通信结果
             if (status.ok() && response.value()) {
-                peer_breaker->RecordSuccess();
+                peer_breaker->RecordSuccess(*peer_permit);
             } else {
-                peer_breaker->RecordFailure();
+                peer_breaker->RecordFailure(*peer_permit);
                 all_success = false;
                 spdlog::warn("Failed to delete key on node {}", addr);
             }
@@ -241,7 +248,10 @@ void KCacheClient::HandleWatchEvents(const etcd::Response& resp) {
                 if (cache_nodes_.find(addr) != cache_nodes_.end()) {
                     cache_nodes_.erase(addr); // 移除该IP
                     consistent_hash_.Remove(addr); // 一致性哈希路由上删除该节点，重新分配哈希环
-                    breaker_pool_.erase(addr); // 清理该节点的熔断器
+                    {
+                        std::lock_guard<std::mutex> breaker_lock(breaker_mutex_);
+                        breaker_pool_.erase(addr); // 清理该节点的熔断器
+                    }
                     RemoveChannel(addr); // 清理该节点的 gRPC Channel 缓存
                     spdlog::debug("Service removed: {} (key: {})", addr, key);
                 }
@@ -340,16 +350,15 @@ void KCacheClient::RemoveChannel(const std::string& addr) {
 }
 
 // 新增辅助函数：新增或获取熔断器
-auto KCacheClient::GetOrCreateBreaker(const std::string& addr) -> CircuitBreaker* {
-    
+auto KCacheClient::GetOrCreateBreaker(const std::string& addr) -> std::shared_ptr<CircuitBreaker> {
+    std::lock_guard<std::mutex> lock(breaker_mutex_);
     auto it = breaker_pool_.find(addr);
     if (it != breaker_pool_.end()) {
-        return it->second.get();
+        return it->second;
     }
-    auto breaker = std::make_unique<CircuitBreaker>("client:" + addr, cb_cfg_);
-    auto* ptr = breaker.get();
-    breaker_pool_[addr] = std::move(breaker);
-    return ptr;
+    auto breaker = std::make_shared<CircuitBreaker>("client:" + addr, cb_cfg_);
+    breaker_pool_[addr] = breaker;
+    return breaker;
 }
 
 }  // namespace kcache

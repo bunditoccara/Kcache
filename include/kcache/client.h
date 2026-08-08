@@ -57,7 +57,7 @@ private:
     // 清理已下线节点的 gRPC Channel 缓存
     void RemoveChannel(const std::string& addr);
     // 新增：per-node 熔断器池
-    auto GetOrCreateBreaker(const std::string& addr) -> CircuitBreaker*;
+    auto GetOrCreateBreaker(const std::string& addr) -> std::shared_ptr<CircuitBreaker>;
 private:
     std::string service_name_; // 服务前端标识
     // etcd服务组件
@@ -74,7 +74,8 @@ private:
     std::mutex channel_mutex_;
 
     // 新增成员：节点per-node熔断池以及节点配置
-    std::unordered_map<std::string, std::unique_ptr<CircuitBreaker>> breaker_pool_;
+    std::unordered_map<std::string, std::shared_ptr<CircuitBreaker>> breaker_pool_;
+    std::mutex breaker_mutex_;
     CircuitBreakerConfig cb_cfg_;  // 保存配置，每个新节点复用
 
     // ★ gRPC 调用超时控制：防止对端假死导致调用线程无限阻塞，引发线程池耗尽与级联雪崩

@@ -171,7 +171,8 @@ auto KCacheGroup::Fallback(const std::string& key) -> ByteViewOptional {
 
 auto KCacheGroup::Load(const std::string& key) -> ByteViewOptional {
     // 熔断器检查：Open 状态直接走降级
-    if (!breaker_->Allow()) {
+    auto permit = breaker_->Allow();
+    if (!permit) {
         ++status_.circuit_breaks;
         spdlog::warn("[CircuitBreaker:{}] Open, key={} -> fallback", name_, key);
         return Fallback(key);
@@ -205,15 +206,21 @@ auto KCacheGroup::Load(const std::string& key) -> ByteViewOptional {
     status_.load_duration += load_ns;
     // 1.真故障处理
     if (ret.is_error) {
-        if (ret.should_trip_breaker) {
-            breaker_->RecordFailure();
+        if (ret.should_report_breaker) {
+            breaker_->RecordFailure(*permit);
+        } else {
+            breaker_->Cancel(*permit);
         }
         spdlog::error("Failed to load data for key: {}", key);
         // getter 真故障（超时/异常/数据库连接失败），走降级
         return Fallback(key);
     }
     // 2.正常处理
-    breaker_->RecordSuccess();
+    if (ret.should_report_breaker) {
+        breaker_->RecordSuccess(*permit);
+    } else {
+        breaker_->Cancel(*permit);
+    }
 
     if(!ret.data){
         // key 不存在：回源未命中，走降级。

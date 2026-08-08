@@ -28,7 +28,7 @@ struct SingleFlightResult {
     std::optional<ByteView> data = std::nullopt;
     bool is_error = false; // 记录是否发生真正的底层故障
     SingleFlightErrorSource error_source = SingleFlightErrorSource::None;
-    bool should_trip_breaker = false; // 只有真实执行回源的先锋线程失败才应计 breaker
+    bool should_report_breaker = false; // 只有代表这次真实回源结果的请求才上报 breaker
 };
 
 class SingleFlight {
@@ -110,15 +110,17 @@ public:
 
         try {
             Result val = func();
-            if (val.is_error && val.should_trip_breaker) {
-                val.should_trip_breaker = MarkFailureOnce(key, new_call);
+            if (val.is_error && val.should_report_breaker) {
+                val.should_report_breaker = MarkFailureOnce(key, new_call);
+            } else if (!val.is_error) {
+                val.should_report_breaker = true;
             }
             // 先锋线程正常完成：把结果写入 promise，所有正在等待 fut 的线程都会被唤醒。
             // val 可以是 nullopt，表示回源失败；上层会根据 nullopt 走 fallback。
             // ★ 安全修复：不再对 clean nullopt 调用 MarkFailed。
             // LoadData 已经通过 is_error 出参区分"数据不存在"与"真故障"，
             // clean nullopt 是正常的业务语义（key 不存在），不应触发冷却期。
-            // 只有真故障（is_error && should_trip_breaker）才会进入失败冷却。
+            // 只有真故障（is_error && should_report_breaker）才会进入失败冷却。
             new_call->prom.set_value(val);
             return val;
         } catch (...) {
@@ -127,9 +129,9 @@ public:
             //
             // 等待线程拿到异常后会在 WaitForResult() 中统一转换为 nullopt，
             // 让上层 Load() 继续按"回源失败"处理。
-            const bool should_trip_breaker = MarkFailureOnce(key, new_call);
+            const bool should_report_breaker = MarkFailureOnce(key, new_call);
             new_call->prom.set_exception(std::current_exception());
-            return {std::nullopt, true, SingleFlightErrorSource::PioneerFailure, should_trip_breaker};
+            return {std::nullopt, true, SingleFlightErrorSource::PioneerFailure, should_report_breaker};
         }
     }
 
@@ -151,18 +153,18 @@ private:
             // 把同 key 的后续请求全部永久拖住。
             if (wait_timeout.count() > 0 &&
                 call->fut.wait_for(wait_timeout) != std::future_status::ready) {
-                const bool should_trip_breaker = MarkFailureOnce(key, call);
+                const bool should_report_breaker = MarkFailureOnce(key, call);
                 Forget(key, call);
                 return {std::nullopt, true,
-                        should_trip_breaker ? SingleFlightErrorSource::PioneerFailure
-                                            : SingleFlightErrorSource::WaiterTimeout,
-                        should_trip_breaker};
+                        should_report_breaker ? SingleFlightErrorSource::PioneerFailure
+                                              : SingleFlightErrorSource::WaiterTimeout,
+                        should_report_breaker};
             }
 
             // 没有设置等待超时，或先锋线程已经完成：读取共享结果。
             // 如果先锋线程 set_exception，这里会抛出，并在 catch 中转换为 nullopt。
             auto result = call->fut.get();
-            result.should_trip_breaker = false; // 等待线程复用先锋结果，不应重复累计 breaker
+            result.should_report_breaker = false; // 等待线程复用先锋结果，不应重复上报 breaker
             return result;
         } catch (...) {
             // 先锋线程失败（func 抛异常或上层超时返回 nullopt），收音机线程统一返回 nullopt，

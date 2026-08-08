@@ -269,7 +269,7 @@ TEST(SingleFlightTest, WaiterTimeoutForgetsStalledCall) {
     EXPECT_FALSE(waiter_result.data.has_value());
     EXPECT_TRUE(waiter_result.is_error); // 等待线程超时退出，根据你的设计 is_error 为 true
     EXPECT_EQ(waiter_result.error_source, SingleFlightErrorSource::PioneerFailure);
-    EXPECT_TRUE(waiter_result.should_trip_breaker);
+    EXPECT_TRUE(waiter_result.should_report_breaker);
     EXPECT_LT(waiter_elapsed.count(), 150);
     EXPECT_EQ(pioneer_runs.load(), 1);
 
@@ -320,7 +320,7 @@ TEST(SingleFlightTest, WaiterTimeoutReportsPioneerFailureOnlyOnce) {
     EXPECT_FALSE(waiter_result.data.has_value());
     EXPECT_TRUE(waiter_result.is_error);
     EXPECT_EQ(waiter_result.error_source, SingleFlightErrorSource::PioneerFailure);
-    EXPECT_TRUE(waiter_result.should_trip_breaker);
+    EXPECT_TRUE(waiter_result.should_report_breaker);
 
     release_pioneer.store(true);
     pioneer.join();
@@ -328,7 +328,7 @@ TEST(SingleFlightTest, WaiterTimeoutReportsPioneerFailureOnlyOnce) {
     EXPECT_FALSE(pioneer_result.data.has_value());
     EXPECT_TRUE(pioneer_result.is_error);
     EXPECT_EQ(pioneer_result.error_source, SingleFlightErrorSource::PioneerFailure);
-    EXPECT_FALSE(pioneer_result.should_trip_breaker);
+    EXPECT_FALSE(pioneer_result.should_report_breaker);
 }
 
 // 移动构造后，已缓存的值仍可直接命中，不重复回源

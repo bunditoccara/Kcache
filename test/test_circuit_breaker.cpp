@@ -2,9 +2,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "kcache/cache.h"
 #include "kcache/circuit_breaker.h"
@@ -14,11 +16,20 @@ using namespace kcache;
 
 // ─── CircuitBreaker 单元测试 ───────────────────────────────────────────────
 
+static auto RequirePermit(CircuitBreaker& cb) -> CircuitBreaker::Permit {
+    auto permit = cb.Allow();
+    if (!permit) {
+        ADD_FAILURE() << "expected circuit breaker permit";
+        return 0;
+    }
+    return *permit;
+}
+
 // 初始状态为 Closed，Allow() 始终返回 true
 TEST(CircuitBreakerTest, InitialStateClosed) {
     CircuitBreaker cb("test_init");
     EXPECT_EQ(cb.StateName(), "Closed");
-    EXPECT_TRUE(cb.Allow());
+    EXPECT_TRUE(cb.Allow().has_value());
 }
 
 // 连续失败达到阈值后进入 Open 状态
@@ -27,13 +38,13 @@ TEST(CircuitBreakerTest, OpensAfterFailureThreshold) {
     cfg.failure_threshold = 3;
     CircuitBreaker cb("test_open", cfg);
 
-    cb.RecordFailure();
-    cb.RecordFailure();
+    cb.RecordFailure(RequirePermit(cb));
+    cb.RecordFailure(RequirePermit(cb));
     EXPECT_EQ(cb.StateName(), "Closed");  // 未达阈值
 
-    cb.RecordFailure();
+    cb.RecordFailure(RequirePermit(cb));
     EXPECT_EQ(cb.StateName(), "Open");    // 达到阈值，熔断
-    EXPECT_FALSE(cb.Allow());
+    EXPECT_FALSE(cb.Allow().has_value());
 }
 
 // Open 状态超过恢复时间后，Allow() 返回 true 并切换到 HalfOpen
@@ -43,12 +54,12 @@ TEST(CircuitBreakerTest, TransitionsToHalfOpenAfterTimeout) {
     cfg.recovery_timeout_ms = 50;  // 50ms 恢复
     CircuitBreaker cb("test_halfopen", cfg);
 
-    cb.RecordFailure();
+    cb.RecordFailure(RequirePermit(cb));
     EXPECT_EQ(cb.StateName(), "Open");
-    EXPECT_FALSE(cb.Allow());
+    EXPECT_FALSE(cb.Allow().has_value());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    EXPECT_TRUE(cb.Allow());  // 超时后放行探测请求
+    EXPECT_TRUE(cb.Allow().has_value());  // 超时后放行探测请求
     EXPECT_EQ(cb.StateName(), "HalfOpen");
 }
 
@@ -61,13 +72,14 @@ TEST(CircuitBreakerTest, RecoversToClosed) {
     cfg.half_open_max_calls = 3;
     CircuitBreaker cb("test_recover", cfg);
 
-    cb.RecordFailure();
+    cb.RecordFailure(RequirePermit(cb));
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    cb.Allow();  // 触发切换到 HalfOpen
+    auto first_probe = RequirePermit(cb);  // 触发切换到 HalfOpen
+    auto second_probe = RequirePermit(cb);
 
-    cb.RecordSuccess();
+    cb.RecordSuccess(first_probe);
     EXPECT_EQ(cb.StateName(), "HalfOpen");  // 还差一次
-    cb.RecordSuccess();
+    cb.RecordSuccess(second_probe);
     EXPECT_EQ(cb.StateName(), "Closed");    // 恢复
 }
 
@@ -78,11 +90,11 @@ TEST(CircuitBreakerTest, HalfOpenFailureReopens) {
     cfg.recovery_timeout_ms = 50;
     CircuitBreaker cb("test_reopen", cfg);
 
-    cb.RecordFailure();
+    cb.RecordFailure(RequirePermit(cb));
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    cb.Allow();  // 切换到 HalfOpen
+    auto probe = RequirePermit(cb);  // 切换到 HalfOpen
 
-    cb.RecordFailure();  // 探测失败
+    cb.RecordFailure(probe);  // 探测失败
     EXPECT_EQ(cb.StateName(), "Open");
 }
 
@@ -94,17 +106,17 @@ TEST(CircuitBreakerTest, FailureCountSurvivesSuccess) {
     CircuitBreaker cb("test_fail_survives", cfg);
 
     // 模式: F, F, F, F, S → 4次失败，1次成功（旧实现在此清零，新实现保留）
-    cb.RecordFailure();
-    cb.RecordFailure();
-    cb.RecordFailure();
-    cb.RecordFailure();
+    cb.RecordFailure(RequirePermit(cb));
+    cb.RecordFailure(RequirePermit(cb));
+    cb.RecordFailure(RequirePermit(cb));
+    cb.RecordFailure(RequirePermit(cb));
     EXPECT_EQ(cb.StateName(), "Closed");  // 未达阈值5
 
-    cb.RecordSuccess();
+    cb.RecordSuccess(RequirePermit(cb));
     EXPECT_EQ(cb.StateName(), "Closed");  // 成功不清零，仍 Closed
 
     // 再失败1次，累计达到5，触发熔断
-    cb.RecordFailure();
+    cb.RecordFailure(RequirePermit(cb));
     EXPECT_EQ(cb.StateName(), "Open");  // 累计5次失败触发熔断
 }
 
@@ -115,21 +127,21 @@ TEST(CircuitBreakerTest, FailureCountResetsAfterWindowExpiry) {
     cfg.failure_reset_timeout_ms = 80;  // 80ms 窗口
     CircuitBreaker cb("test_window_expire", cfg);
 
-    cb.RecordFailure();
-    cb.RecordFailure();
-    cb.RecordFailure();
+    cb.RecordFailure(RequirePermit(cb));
+    cb.RecordFailure(RequirePermit(cb));
+    cb.RecordFailure(RequirePermit(cb));
     EXPECT_EQ(cb.StateName(), "Closed");
 
     // 等待窗口过期
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // 窗口过期后成功，清零计数
-    cb.RecordSuccess();
+    cb.RecordSuccess(RequirePermit(cb));
     EXPECT_EQ(cb.StateName(), "Closed");
 
     // 清零后再失败，从头计数
-    cb.RecordFailure();
-    cb.RecordFailure();
+    cb.RecordFailure(RequirePermit(cb));
+    cb.RecordFailure(RequirePermit(cb));
     EXPECT_EQ(cb.StateName(), "Closed");  // 只累加到2
 }
 
@@ -143,15 +155,149 @@ TEST(ClientCircuitBreakerTest, PerNodeBreakerIndependent) {
     CircuitBreaker breaker_b("client:nodeB", cfg);
     
     // nodeA 连续失败熔断
-    for (int i = 0; i < 3; ++i) breaker_a.RecordFailure();
+    for (int i = 0; i < 3; ++i) breaker_a.RecordFailure(RequirePermit(breaker_a));
     EXPECT_EQ(breaker_a.StateName(), "Open");
     
     // nodeB 不受影响
     EXPECT_EQ(breaker_b.StateName(), "Closed");
-    EXPECT_TRUE(breaker_b.Allow());
+    EXPECT_TRUE(breaker_b.Allow().has_value());
     
     // nodeA 熔断后拒绝请求
-    EXPECT_FALSE(breaker_a.Allow());
+    EXPECT_FALSE(breaker_a.Allow().has_value());
+}
+
+TEST(CircuitBreakerTest, HalfOpenTransitionConsumesFirstSlot) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.recovery_timeout_ms = 20;
+    cfg.half_open_max_calls = 1;
+    CircuitBreaker cb("slot", cfg);
+
+    cb.RecordFailure(RequirePermit(cb));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_TRUE(cb.Allow().has_value());
+    EXPECT_FALSE(cb.Allow().has_value());
+}
+
+TEST(CircuitBreakerTest, ConcurrentHalfOpenAdmissionHonorsLimit) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.recovery_timeout_ms = 20;
+    cfg.half_open_max_calls = 2;
+    CircuitBreaker cb("concurrent_limit", cfg);
+
+    cb.RecordFailure(RequirePermit(cb));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    constexpr int kThreads = 16;
+    std::atomic_bool start{false};
+    std::atomic_int admitted{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            if (cb.Allow().has_value()) {
+                admitted.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(admitted.load(), cfg.half_open_max_calls);
+}
+
+TEST(CircuitBreakerTest, OldPermitCannotRecoverNewGeneration) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.recovery_timeout_ms = 20;
+    cfg.success_threshold = 1;
+    cfg.half_open_max_calls = 1;
+    CircuitBreaker cb("generation", cfg);
+
+    auto old = RequirePermit(cb);
+    cb.RecordFailure(RequirePermit(cb));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    auto probe = RequirePermit(cb);
+    cb.RecordSuccess(old);
+    EXPECT_EQ(cb.State(), CircuitState::HalfOpen);
+    cb.RecordSuccess(probe);
+    EXPECT_EQ(cb.State(), CircuitState::Closed);
+}
+
+TEST(CircuitBreakerTest, HalfOpenWaitsForEveryAdmittedProbe) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.recovery_timeout_ms = 20;
+    cfg.half_open_max_calls = 2;
+    cfg.success_threshold = 1;
+    CircuitBreaker cb("all_probes", cfg);
+
+    cb.RecordFailure(RequirePermit(cb));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    auto first = RequirePermit(cb);
+    auto second = RequirePermit(cb);
+    cb.RecordSuccess(first);
+    EXPECT_EQ(cb.State(), CircuitState::HalfOpen);
+    cb.RecordFailure(second);
+    EXPECT_EQ(cb.State(), CircuitState::Open);
+}
+
+TEST(CircuitBreakerTest, CancelReturnsHalfOpenSlot) {
+    CircuitBreakerConfig cfg;
+    cfg.failure_threshold = 1;
+    cfg.recovery_timeout_ms = 20;
+    cfg.half_open_max_calls = 1;
+    cfg.success_threshold = 1;
+    CircuitBreaker cb("cancel", cfg);
+
+    cb.RecordFailure(RequirePermit(cb));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    auto cancelled = RequirePermit(cb);
+    cb.Cancel(cancelled);
+    auto replacement = RequirePermit(cb);
+    cb.RecordSuccess(replacement);
+    EXPECT_EQ(cb.State(), CircuitState::Closed);
+}
+
+TEST(SingleFlightCircuitBreakerTest, SharedResultHasSingleBreakerReportOwner) {
+    SingleFlight single_flight;
+    std::promise<void> pioneer_entered;
+    std::promise<void> release_pioneer;
+    auto release = release_pioneer.get_future().share();
+    SingleFlightResult pioneer_result;
+    SingleFlightResult waiter_result;
+
+    std::thread pioneer([&] {
+        pioneer_result = single_flight.Do("shared", [&] {
+            pioneer_entered.set_value();
+            release.wait();
+            return SingleFlightResult{ByteView{"value"}, false,
+                                      SingleFlightErrorSource::None, false};
+        });
+    });
+
+    pioneer_entered.get_future().wait();
+    std::thread waiter([&] {
+        waiter_result = single_flight.Do("shared", [] {
+            ADD_FAILURE() << "waiter unexpectedly became pioneer";
+            return SingleFlightResult{};
+        });
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    release_pioneer.set_value();
+    pioneer.join();
+    waiter.join();
+
+    auto report_owners = static_cast<int>(pioneer_result.should_report_breaker) +
+                         static_cast<int>(waiter_result.should_report_breaker);
+    EXPECT_EQ(report_owners, 1);
 }
 
 // ─── KCacheGroup 熔断+降级集成测试 ────────────────────────────────────────
@@ -337,6 +483,13 @@ TEST_F(CircuitBreakerGroupTest, SingleFlightCooldownRejectedDoesNotCloseHalfOpen
     ASSERT_TRUE(r2.has_value());
     EXPECT_EQ(r2->ToString(), "fallback_value");
     EXPECT_EQ(group.CircuitBreakerState(), "HalfOpen");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    getter_throws_ = false;
+    auto r3 = group.Get("k1");
+    ASSERT_TRUE(r3.has_value());
+    EXPECT_EQ(r3->ToString(), "v1");
+    EXPECT_EQ(group.CircuitBreakerState(), "Closed");
 }
 
 // ─── 安全性测试：合法 nullopt 不触发熔断（防恶意攻击） ────────────────
